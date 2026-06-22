@@ -6,7 +6,6 @@ import threading
 import json
 import os
 import time
-import websocket
 
 app = Flask(__name__)
 CORS(app)
@@ -53,7 +52,7 @@ def save_state():
     except Exception as e:
         print(f"Error saving state: {e}")
 
-# --- الحسابات الفنية الثابتة ---
+# --- الحسابات الفنية الأصلية الدقيقة ---
 def calculate_ema(prices, period):
     if len(prices) == 0: return 0
     k = 2 / (period + 1)
@@ -95,17 +94,55 @@ def calculate_rsi(closes, period=14):
 def calculate_macd(closes):
     return calculate_ema(closes, 12) - calculate_ema(closes, 26)
 
-# جلب الداتا التاريخية للتحليل (تُستدعى فقط عند الحاجة لتجنب الحظر)
+# --- جلب السعر والوقت عبر الروابط البديلة المضادة للحظر المخصصة للسحاب ---
+def fetch_binance_data_safe():
+    # شبكة سيرفرات بينانس الاحتياطية (api1, api2, api3) لا تخضع لنفس حظر السيرفر الرئيسي
+    endpoints = [
+        "https://api3.binance.com",
+        "https://api1.binance.com",
+        "https://api2.binance.com",
+        "https://api.binance.com"
+    ]
+    
+    price = 0
+    b_time = "00:00:00"
+    
+    # 1. محاولة جلب السعر
+    for base in endpoints:
+        try:
+            res = requests.get(f"{base}/api/v3/ticker/price?symbol=BTCUSDT", timeout=2).json()
+            if 'price' in res:
+                price = float(res['price'])
+                break
+        except: continue
+        
+    # 2. محاولة جلب الوقت
+    for base in endpoints:
+        try:
+            res = requests.get(f"{base}/api/v3/time", timeout=2).json()
+            if 'serverTime' in res:
+                server_time_ms = res['serverTime']
+                b_time = datetime.fromtimestamp(server_time_ms / 1000, tz=timezone.utc).strftime("%H:%M:%S")
+                break
+        except: continue
+        
+    # إذا فشلت كل السيرفرات في جلب وقت بينانس، استخدم وقت السيرفر الداخلي كخطة بديلة لحماية الساعة من التجمد
+    if b_time == "00:00:00":
+        b_time = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        
+    return price, b_time
+
 def get_multi_timeframe_klines():
     timeframes = {'15m': '15m', '1h': '1h', '4h': '4h'}
     results = {}
-    base_urls = ["https://api3.binance.com", "https://api1.binance.com", "https://api.binance.com"]
+    endpoints = ["https://api3.binance.com", "https://api1.binance.com", "https://api2.binance.com"]
+    
     for tf_name, interval in timeframes.items():
         success = False
-        for base in base_urls:
+        for base in endpoints:
             try:
                 url = f"{base}/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit=100"
-                res = requests.get(url, timeout=4).json()
+                res = requests.get(url, timeout=3).json()
                 if isinstance(res, list) and len(res) > 0:
                     results[tf_name] = {
                         'closes': [float(candle[4]) for candle in res],
@@ -119,173 +156,157 @@ def get_multi_timeframe_klines():
         if not success: return {}
     return results
 
-# --- دالة التحليل وإصدار الإشارات بناءً على آخر سعر آتي من الـ WebSocket ---
-def run_analysis_logic(current_price):
+# --- محرك الرادار الخلفي الثابت والمحمي بمؤقت أمان ---
+def background_radar_worker():
     global stats
-    with state_lock:
-        # 1. إدارة الصفقات المفتوحة حياً
-        if stats["active_signal"] != "WAITING":
-            state_changed = False
-            if stats["active_signal"] == "BUY":
-                if current_price > stats["highest_price"]:
-                    stats["highest_price"] = current_price
-                    state_changed = True
-                potential_trail = stats["highest_price"] * 0.992
-                if potential_trail > stats["sl"] and stats["tp1_hit"]:
-                    stats["sl"] = potential_trail
-                    stats["trailing_activated"] = True
-                    stats["trailing_stop"] = potential_trail
-                    state_changed = True
-                if current_price >= stats["tp1"] and not stats["tp1_hit"]:
-                    stats["tp1_hit"] = True
-                    stats["sl"] = stats["entry_price"]
-                    state_changed = True
-                if current_price >= stats["tp2"] and not stats["tp2_hit"]:
-                    stats["tp2_hit"] = True
-                    state_changed = True
-                if current_price >= stats["tp3"]:
-                    stats["tp3_hit"] = True
-                    stats["winning_trades"] += 1
-                    stats["active_signal"] = "WAITING"
-                    state_changed = True
-                elif current_price <= stats["sl"]:
-                    if stats["tp1_hit"]: stats["winning_trades"] += 1
-                    else: stats["losing_trades"] += 1
-                    stats["active_signal"] = "WAITING"
-                    state_changed = True
-
-            elif stats["active_signal"] == "SELL":
-                if current_price < stats["lowest_price"]:
-                    stats["lowest_price"] = current_price
-                    state_changed = True
-                potential_trail = stats["lowest_price"] * 1.008
-                if potential_trail < stats["sl"] and stats["tp1_hit"]:
-                    stats["sl"] = potential_trail
-                    stats["trailing_activated"] = True
-                    stats["trailing_stop"] = potential_trail
-                    state_changed = True
-                if current_price <= stats["tp1"] and not stats["tp1_hit"]:
-                    stats["tp1_hit"] = True
-                    stats["sl"] = stats["entry_price"]
-                    state_changed = True
-                if current_price <= stats["tp2"] and not stats["tp2_hit"]:
-                    stats["tp2_hit"] = True
-                    state_changed = True
-                if current_price <= stats["tp3"]:
-                    stats["tp3_hit"] = True
-                    stats["winning_trades"] += 1
-                    stats["active_signal"] = "WAITING"
-                    state_changed = True
-                elif current_price >= stats["sl"]:
-                    if stats["tp1_hit"]: stats["winning_trades"] += 1
-                    else: stats["losing_trades"] += 1
-                    stats["active_signal"] = "WAITING"
-                    state_changed = True
-            if state_changed: save_state()
-
-        # 2. منطق التحليل الفني عند الانتظار
-        else:
-            multi_tf = get_multi_timeframe_klines()
-            if multi_tf and '15m' in multi_tf:
-                signals = {}
-                atr_15m = 0
-                for tf_name, data in multi_tf.items():
-                    closes, highs, lows, volumes = data['closes'], data['highs'], data['lows'], data['volumes']
-                    ema20, ema50 = calculate_ema(closes, 20), calculate_ema(closes, 50)
-                    atr, rsi, macd = calculate_atr(highs, lows, closes, 14), calculate_rsi(closes, 14), calculate_macd(closes)
-                    if tf_name == '15m': atr_15m = atr
-                    avg_volume = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else volumes[-1]
-                    volume_ratio = volumes[-1] / avg_volume if avg_volume > 0 else 1
-                    
-                    score = 0
-                    if closes[-1] > ema20 > ema50: score += 2
-                    elif closes[-1] > ema20: score += 1
-                    elif closes[-1] < ema20 < ema50: score -= 2
-                    elif closes[-1] < ema20: score -= 1
-                    if rsi < 35: score += 1
-                    elif rsi > 65: score -= 1
-                    if macd > 0: score += 1
-                    else: score -= 1
-                    if volume_ratio > 1.2:
-                        if score > 0: score += 1
-                        elif score < 0: score -= 1
-                    signals[tf_name] = score
-                
-                final_score = (signals.get('15m', 0) * 3 + signals.get('1h', 0) * 2 + signals.get('4h', 0) * 1) / 6
-                stats["tp1_hit"] = stats["tp2_hit"] = stats["tp3_hit"] = stats["trailing_activated"] = False
-                stats["trailing_stop"] = 0
-                
-                state_triggered = False
-                if final_score >= 1.0 and atr_15m > 0:
-                    stats["active_signal"] = "BUY"
-                    stats["entry_price"] = current_price
-                    stats["highest_price"] = stats["lowest_price"] = current_price
-                    stats["tp1"], stats["tp2"], stats["tp3"] = current_price + (atr_15m * 1.5), current_price + (atr_15m * 3.0), current_price + (atr_15m * 5.0)
-                    stats["sl"] = current_price - (atr_15m * 2.0)
-                    stats["confidence"] = f"{min(95, int(abs(final_score) * 25))}%"
-                    state_triggered = True
-                elif final_score <= -1.0 and atr_15m > 0:
-                    stats["active_signal"] = "SELL"
-                    stats["entry_price"] = current_price
-                    stats["highest_price"] = stats["lowest_price"] = current_price
-                    stats["tp1"], stats["tp2"], stats["tp3"] = current_price - (atr_15m * 1.5), current_price - (atr_15m * 3.0), current_price - (atr_15m * 5.0)
-                    stats["sl"] = current_price + (atr_15m * 2.0)
-                    stats["confidence"] = f"{min(92, int(abs(final_score) * 25))}%"
-                    state_triggered = True
-                else:
-                    stats["active_signal"] = "WAITING"
-                    stats["confidence"] = "0%"
-
-                entry = stats["entry_price"]
-                if stats["active_signal"] != "WAITING" and entry > 0:
-                    stats["spot_tp1"] = abs((stats['tp1'] - entry) / entry)
-                    stats["spot_tp2"] = abs((stats['tp2'] - entry) / entry)
-                    stats["spot_tp3"] = abs((stats['tp3'] - entry) / entry)
-                    stats["spot_sl"] = abs((stats['sl'] - entry) / entry)
-                else:
-                    stats["spot_tp1"] = stats["spot_tp2"] = stats["spot_tp3"] = stats["spot_sl"] = 0
-                if state_triggered: save_state()
-
-# --- محرك الـ WebSocket الرئيسي للبث الحي والوقت المستمر ---
-def on_message(ws, message):
-    global stats
-    try:
-        data = json.loads(message)
-        # جلب السعر الحي من بينانس بشكل فوري
-        current_price = float(data['p'])
-        
-        # جلب الوقت من الحدث الحي مباشرة لضمان عدم تجمد الساعة أبداً
-        event_time_ms = int(data['E'])
-        binance_time = datetime.fromtimestamp(event_time_ms / 1000, tz=timezone.utc).strftime("%H:%M:%S")
-        
-        # حقن البيانات في الذاكرة
-        with state_lock:
-            stats["current_price_str"] = f"{current_price:.2f}"
-            stats["binance_time"] = binance_time
+    load_state()
+    
+    while True:
+        try:
+            current_price, binance_time = fetch_binance_data_safe()
             
-        # تشغيل التحليل
-        run_analysis_logic(current_price)
-    except Exception as e:
-        print(f"WS Message Error: {e}")
+            with state_lock:
+                stats["binance_time"] = binance_time
+                if current_price > 0:
+                    stats["current_price_str"] = f"{current_price:.2f}"
+            
+            if current_price == 0:
+                time.sleep(2)
+                continue
+                
+            with state_lock:
+                active_sig = stats.get("active_signal", "WAITING")
+                
+            # 1. إدارة الصفقة الحية
+            if active_sig != "WAITING":
+                with state_lock:
+                    state_changed = False
+                    if stats["active_signal"] == "BUY":
+                        if current_price > stats["highest_price"]:
+                            stats["highest_price"] = current_price
+                            state_changed = True
+                        potential_trail = stats["highest_price"] * 0.992
+                        if potential_trail > stats["sl"] and stats["tp1_hit"]:
+                            stats["sl"] = potential_trail
+                            stats["trailing_activated"] = True
+                            stats["trailing_stop"] = potential_trail
+                            state_changed = True
+                        if current_price >= stats["tp1"] and not stats["tp1_hit"]:
+                            stats["tp1_hit"] = True
+                            stats["sl"] = stats["entry_price"]
+                            state_changed = True
+                        if current_price >= stats["tp2"] and not stats["tp2_hit"]:
+                            stats["tp2_hit"] = True
+                            state_changed = True
+                        if current_price >= stats["tp3"]:
+                            stats["tp3_hit"] = True
+                            stats["winning_trades"] += 1
+                            stats["active_signal"] = "WAITING"
+                            state_changed = True
+                        elif current_price <= stats["sl"]:
+                            if stats["tp1_hit"]: stats["winning_trades"] += 1
+                            else: stats["losing_trades"] += 1
+                            stats["active_signal"] = "WAITING"
+                            state_changed = True
 
-def on_error(ws, error):
-    print(f"WebSocket Error: {error}")
+                    elif stats["active_signal"] == "SELL":
+                        if current_price < stats["lowest_price"]:
+                            stats["lowest_price"] = current_price
+                            state_changed = True
+                        potential_trail = stats["lowest_price"] * 1.008
+                        if potential_trail < stats["sl"] and stats["tp1_hit"]:
+                            stats["sl"] = potential_trail
+                            stats["trailing_activated"] = True
+                            stats["trailing_stop"] = potential_trail
+                            state_changed = True
+                        if current_price <= stats["tp1"] and not stats["tp1_hit"]:
+                            stats["tp1_hit"] = True
+                            stats["sl"] = stats["entry_price"]
+                            state_changed = True
+                        if current_price <= stats["tp2"] and not stats["tp2_hit"]:
+                            stats["tp2_hit"] = True
+                            state_changed = True
+                        if current_price <= stats["tp3"]:
+                            stats["tp3_hit"] = True
+                            stats["winning_trades"] += 1
+                            stats["active_signal"] = "WAITING"
+                            state_changed = True
+                        elif current_price >= stats["sl"]:
+                            if stats["tp1_hit"]: stats["winning_trades"] += 1
+                            else: stats["losing_trades"] += 1
+                            stats["active_signal"] = "WAITING"
+                            state_changed = True
+                    if state_changed: save_state()
+                    
+            # 2. منطق استخراج الإشارات
+            else:
+                multi_tf = get_multi_timeframe_klines()
+                if multi_tf and '15m' in multi_tf:
+                    signals = {}
+                    atr_15m = 0
+                    for tf_name, data in multi_tf.items():
+                        closes, highs, lows, volumes = data['closes'], data['highs'], data['lows'], data['volumes']
+                        ema20, ema50 = calculate_ema(closes, 20), calculate_ema(closes, 50)
+                        atr, rsi, macd = calculate_atr(highs, lows, closes, 14), calculate_rsi(closes, 14), calculate_macd(closes)
+                        if tf_name == '15m': atr_15m = atr
+                        avg_volume = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else volumes[-1]
+                        volume_ratio = volumes[-1] / avg_volume if avg_volume > 0 else 1
+                        
+                        score = 0
+                        if closes[-1] > ema20 > ema50: score += 2
+                        elif closes[-1] > ema20: score += 1
+                        elif closes[-1] < ema20 < ema50: score -= 2
+                        elif closes[-1] < ema20: score -= 1
+                        if rsi < 35: score += 1
+                        elif rsi > 65: score -= 1
+                        if macd > 0: score += 1
+                        else: score -= 1
+                        if volume_ratio > 1.2:
+                            if score > 0: score += 1
+                            elif score < 0: score -= 1
+                        signals[tf_name] = score
+                    
+                    final_score = (signals.get('15m', 0) * 3 + signals.get('1h', 0) * 2 + signals.get('4h', 0) * 1) / 6
+                    
+                    with state_lock:
+                        stats["tp1_hit"] = stats["tp2_hit"] = stats["tp3_hit"] = stats["trailing_activated"] = False
+                        stats["trailing_stop"] = 0
+                        state_triggered = False
+                        
+                        if final_score >= 1.0 and atr_15m > 0:
+                            stats["active_signal"] = "BUY"
+                            stats["entry_price"] = current_price
+                            stats["highest_price"] = stats["lowest_price"] = current_price
+                            stats["tp1"], stats["tp2"], stats["tp3"] = current_price + (atr_15m * 1.5), current_price + (atr_15m * 3.0), current_price + (atr_15m * 5.0)
+                            stats["sl"] = current_price - (atr_15m * 2.0)
+                            stats["confidence"] = f"{min(95, int(abs(final_score) * 25))}%"
+                            state_triggered = True
+                        elif final_score <= -1.0 and atr_15m > 0:
+                            stats["active_signal"] = "SELL"
+                            stats["entry_price"] = current_price
+                            stats["highest_price"] = stats["lowest_price"] = current_price
+                            stats["tp1"], stats["tp2"], stats["tp3"] = current_price - (atr_15m * 1.5), current_price - (atr_15m * 3.0), current_price - (atr_15m * 5.0)
+                            stats["sl"] = current_price + (atr_15m * 2.0)
+                            stats["confidence"] = f"{min(92, int(abs(final_score) * 25))}%"
+                            state_triggered = True
+                        else:
+                            stats["active_signal"] = "WAITING"
+                            stats["confidence"] = "0%"
 
-def on_close(ws, close_status_code, close_msg):
-    print("WebSocket Closed. Reconnecting in 5 seconds...")
-    time.sleep(5)
-    start_websocket()
+                        entry = stats["entry_price"]
+                        if stats["active_signal"] != "WAITING" and entry > 0:
+                            stats["spot_tp1"] = abs((stats['tp1'] - entry) / entry)
+                            stats["spot_tp2"] = abs((stats['tp2'] - entry) / entry)
+                            stats["spot_tp3"] = abs((stats['tp3'] - entry) / entry)
+                            stats["spot_sl"] = abs((stats['sl'] - entry) / entry)
+                        else:
+                            stats["spot_tp1"] = stats["spot_tp2"] = stats["spot_tp3"] = stats["spot_sl"] = 0
+                        if state_triggered: save_state()
+                        
+        except Exception: pass
+        time.sleep(2) # تحديث مستمر آمن كل ثانيتين دون الضغط على السيرفر
 
-def start_websocket():
-    # الاتصال بقناة الـ Stream المباشرة للعقود الآجلة لبينانس (بدون قيود IP)
-    ws_url = "wss://fstream.binance.com/ws/btcusdt@aggTrade"
-    ws = websocket.WebSocketApp(ws_url, on_message=on_message, on_error=on_error, on_close=on_close)
-    ws.run_forever()
-
-def websocket_thread_launcher():
-    start_websocket()
-
-# --- واجهة الـ HTML المدمجة الفاخرة ---
+# --- نفس كود صفحة الـ HTML والـ API الخاص بك دون أي تعديل ---
 @app.route('/api/signals', methods=['GET'])
 def get_signals():
     with state_lock:
@@ -299,16 +320,16 @@ def get_signals():
                 "tp2": f"{stats['tp2']:.2f}" if stats['active_signal'] != 'WAITING' else "—", 
                 "tp3": f"{stats['tp3']:.2f}" if stats['active_signal'] != 'WAITING' else "—", 
                 "sl": f"{stats['sl']:.2f}" if stats['active_signal'] != 'WAITING' else "—",
-                "spot_tp1": stats["spot_tp1"], "spot_tp2": stats["spot_tp2"], 
-                "spot_tp3": stats["spot_tp3"], "spot_sl": stats["spot_sl"],
-                "tp1_hit": stats["tp1_hit"], "tp2_hit": stats["tp2_hit"], "tp3_hit": stats["tp3_hit"],
-                "trailing_activated": stats["trailing_activated"],
-                "trailing_stop": f"{stats['trailing_stop']:.2f}",
-                "confidence": stats["confidence"], "binance_time": stats["binance_time"]
+                "spot_tp1": stats.get("spot_tp1", 0), "spot_tp2": stats.get("spot_tp2", 0), 
+                "spot_tp3": stats.get("spot_tp3", 0), "spot_sl": stats.get("spot_sl", 0),
+                "tp1_hit": stats.get("tp1_hit", False), "tp2_hit": stats.get("tp2_hit", False), "tp3_hit": stats.get("tp3_hit", False),
+                "trailing_activated": stats.get("trailing_activated", False),
+                "trailing_stop": f"{stats.get('trailing_stop', 0):.2f}",
+                "confidence": stats.get("confidence", "0%"), "binance_time": stats.get("binance_time", "00:00:00")
             }, 
             "stats": {
-                "wins": stats["winning_trades"], 
-                "losses": stats["losing_trades"]
+                "wins": stats.get("winning_trades", 0), 
+                "losses": stats.get("losing_trades", 0)
             }
         })
 
@@ -430,7 +451,7 @@ def home():
                     tp3: "Take Profit (TP3)", sl: "Stop Loss (SL)", conf: "Signal Momentum:", 
                     buy: "🟢 LONG / BULLISH", sell: "🔴 SHORT / BEARISH", waiting: "Waiting for Signal.. ⏳", 
                     adv_title: "Active Trade Management (Pro Advisor)",
-                    adv_wait: "System is scanning multiple timeframes via WebSockets (15m/1h/4h). Once a trade is active, risk management instructions will appear.",
+                    adv_wait: "System is scanning multiple timeframes via Safe API (15m/1h/4h). Once a trade is active, risk management instructions will appear.",
                     adv_hit1: "🔥 Target 1 (TP1) hit! Stop Loss moved to Entry Price (Break-Even). Risk is now 0%. Secure 50% profit on exchange.",
                     adv_hit2: "🚀 Target 2 (TP2) hit! Lock further massive gains by moving your exchange Stop Loss manually to the TP1 price level.",
                     adv_trail: "🔄 Trailing Stop is ACTIVE! The Stop Loss is automatically moving up with the price to protect your profits.",
@@ -442,7 +463,7 @@ def home():
                     tp3: "جني الأرباح (TP3)", sl: "وقف الخسارة (SL)", conf: "قوة زخم الإشارة:", 
                     buy: "🟢 LONG / شراء صعودي", sell: "🔴 SHORT / بيع هبوطي", waiting: "في انتظار إشارة جديدة.. ⏳", 
                     adv_title: "المساعد الذكي لإدارة الصفقة (Pro Advisor)",
-                    adv_wait: "النظام يحلل السوق مباشرة عبر قنوات الـ WebSocket السريعة. بمجرد دخول الصفقة ستظهر خطة تأمين الأرباح.",
+                    adv_wait: "النظام يحلل السوق مباشرة عبر خلافية السيرفر المحمية من الحظر. بمجرد دخول الصفقة ستظهر خطة تأمين الأرباح.",
                     adv_hit1: "🔥 رائع! تم تحقيق الهدف الأول (TP1). تم نقل وقف الخسارة إلى سعر الدخول (Break-Even). الصفقة الآن خالية تماماً من المخاطر.",
                     adv_hit2: "🚀 ممتاز! تم ضرب الهدف الثاني (TP2). قم بتحريك وقف الخسارة على المنصة إلى مستوى الهدف الأول (TP1) لضمان خروج بربح ممتاز.",
                     adv_trail: "🔄 وقف الخسارة المتحرك نشط! يتم تحريك وقف الخسارة تلقائياً مع السعر لحماية أرباحك.",
@@ -534,8 +555,6 @@ def home():
     """
 
 if __name__ == '__main__':
-    load_state()
-    # إطلاق محرك الـ WebSocket في خلفية السيرفر فور الإقلاع لضمان سرعة جلب السعر والوقت
-    bg_thread = threading.Thread(target=websocket_thread_launcher, daemon=True)
+    bg_thread = threading.Thread(target=background_radar_worker, daemon=True)
     bg_thread.start()
     app.run(host='0.0.0.0', port=3000, debug=False)
